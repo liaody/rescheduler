@@ -40,9 +40,13 @@ Other Features
 
 ## Design Goals
 
+1. Light weight. Leave as much control to user as possible.
+2. Fast response: no polling, pipe architecture for immediate job response time.
+3. No Setup: Can not require extra "maintenance thread" in background. Auto maintained by each and every worker thread.
+
 ### Motivations
 
-1. Simplify Deployment: Redis as the only in-memory cache infrastructure piece.
+1. Simplify Deployment: Redis as the only in-memory cache infrastructure piece. No more depency on Beanstalkd or similar queuing solutions.
 2. Simplify Persistence: backup and replication can be shared with all Redis data sets.
 3. Fast response: Beanstalkd's no polling pipe architecture for immediate job response time.
 4. No Setup: Can not require extra "maintenance thread" in background. Has to be self maintained.
@@ -90,6 +94,8 @@ NOTE: Change prefix will invalidate current jobs.
 * One global "deferred" sorted set, score is timestamp
 * One global "counter" integer for auto-incremented IDs
 * One global "maintenance" list, special queue for maintenance tasks
+* One global "args" hash for deferred and immediate jobs
+* One global "running" hash for currently running jobs (or jobs that worker die while running)
 
 ## Other similar jobs
 * Resque: Uses polling

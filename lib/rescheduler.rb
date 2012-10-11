@@ -7,6 +7,7 @@ module Rescheduler
   # Setup configuration
   attr_accessor :config
   self.config = {}
+
   #==========================
   # Management routines
   def prefix
@@ -14,8 +15,8 @@ module Rescheduler
   end
 
   def reinitialize # Very slow reinitialize
-    keys = %w{TMCOUNTER TMMAINT TMDEFERRED}
-    %w{TMTUBE:* TMARGS:* TMRUNNING:*}.each do |p|
+    keys = %w{TMCOUNTER TMMAINT TMDEFERRED TMARGS TMRUNNING}.map {|p| prefix + p }
+    %w{TMTUBE:*}.each do |p|
       keys += redis.keys(prefix + p)
     end
     redis.del(keys)
@@ -23,15 +24,56 @@ module Rescheduler
 
   # Return a hash of statistics
   def stats
-    qnids = redis.keys(rk_args('*'))
-    stats = {}
-    qnids.each do |k|
-      qnid = k.split('TMARGS:')[1]
-      queue = qnid_to_queue(qnid)
-      stats[queue] ||= 0
-      stats[queue] += 1
+    loop do 
+      redis.watch(rk_args) do
+        stats = {}
+        qnids = redis.hkeys(rk_args)
+        # Get all the "pending jobs"
+        qnids.each do |qnid|
+          queue = qnid_to_queue(qnid)
+          stats[queue] ||= {}
+          stats[queue][:pending] ||= 0
+          stats[queue][:pending] += 1
+        end
+
+        # Get all running
+        qnids = redis.hkeys(rk_running)
+        # Get all the "pending jobs"
+        qnids.each do |qnid|
+          queue = qnid_to_queue(qnid)
+          stats[queue] ||= {}
+          stats[queue][:running] ||= 0
+          stats[queue][:running] += 1
+        end
+
+        # Get all the deferred
+        deferred = redis.zrange(rk_deferred, 0, -1, :with_scores=>true)
+        deferred.each do |qnid, ts|
+          queue = qnid_to_queue(qnid)
+          stats[queue] ||= {}
+          stats[queue][:deferred] ||= 0
+          stats[queue][:deferred] += 1
+          stats[queue][:first] ||= ts # First is first
+        end        
+
+        # Get all the immediate
+        qus = stats.keys
+        quls = redis.multi do
+          qus.each { |queue| redis.llen(rk_queue(queue)) }
+        end
+
+        unless quls # Retry
+          log_debug('Contention during stats')
+          next 
+        end
+
+        qus.each_with_index do |k, idx|
+          stats[k][:immediate] = quls[idx]
+        end
+
+        return {:jobs=>stats}
+      end
     end
-    return {:jobs=>stats}
   end
 
   #==========================
@@ -67,7 +109,7 @@ module Rescheduler
       end
 
       # Save options
-      redis.set(rk_args(qnid), options.to_json)
+      redis.hset(rk_args, qnid, options.to_json)
 
       # Determine the due time
       if ts > now.to_i # Future job
@@ -91,7 +133,7 @@ module Rescheduler
   def exists?(options)
     raise ArgumentError, 'Can not test existence without :id' unless options.include?(:id)
     qnid = get_qnid(options)
-    return redis.exists(rk_args(qnid))
+    return redis.hexists(rk_args, qnid)
   end
 
   def enqueue_unless_exists(options)
@@ -102,7 +144,7 @@ module Rescheduler
     qnid = get_qnid(options)
     
     redis.multi do
-      redis.del(rk_args(qnid))
+      redis.hdel(rk_args, qnid)
       redis.zrem(rk_deferred, qnid)
       redis.lrem(rk_queue(options[:queue]), 0, qnid)
     end
@@ -178,21 +220,20 @@ module Rescheduler
   # Runner routines
   def run_job(qnid)
     # First load job parameters for running
-    rk = rk_args(qnid)
-    rkr = rk_running(qnid)
     optstr = nil
     begin
       res = nil
-      redis.watch(rk) do # Transaction to ensure read/delete is atomic
-        optstr = redis.get(rk)        
+      # Note: We use a single key to watch, can be improved by having a per-job key, 
+      redis.watch(rk_args) do # Transaction to ensure read/delete is atomic
+        optstr = redis.hget(rk_args, qnid)        
         if optstr.nil?
           redis.unwatch
           log_debug("Job is deleted mysteriously")
           return # Job is deleted somewhere
         end
         res = redis.multi do 
-          redis.del(rk)
-          redis.set(rkr, optstr)
+          redis.hdel(rk_args, qnid)
+          redis.hset(rk_running, qnid, optstr)
         end
         if !res
           # Contention, try read again
@@ -218,7 +259,7 @@ module Rescheduler
     end
 
     # 3. Remove job from running list (Done)
-    redis.del(rkr)
+    redis.hdel(rk_running, qnid)
   end
 
   # Helper routines
@@ -270,21 +311,26 @@ module Rescheduler
     return nt
   end
 
-  def rk_queue(tube)
-    return "#{prefix}TMTUBE:#{tube}"
-  end
+  def rk_queue(queue); "#{prefix}TMTUBE:#{queue}"; end
 
   def rk_deferred; prefix + 'TMDEFERRED'; end
   def rk_maintenace; prefix + 'TMMAINT'; end
-  def rk_args(qnid); "#{prefix}TMARGS:#{qnid}"; end
-  def rk_running(qnid); "#{prefix}TMRUNNING:#{qnid}"; end
+  def rk_args; prefix + "TMARGS"; end
+  def rk_running; prefix + "TMRUNNING"; end
   def rk_counter; prefix + 'TMCOUNTER'; end
 
   def get_qnid(options)
     return "#{options[:queue]}:#{options[:id]}"
   end
 
-  def qnid_to_queue(qnid); qnid[0...qnid.index(':')]; end
+  def qnid_to_queue(qnid)
+    idx = qnid.index(':')
+    unless idx
+      log_debug("Invalid qnid: #{qnid}")
+      return nil 
+    end
+    qnid[0...idx]
+  end
 
   def redis
     @redis ||= Redis.new(@config[:redis_connection] || {})
