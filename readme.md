@@ -6,7 +6,7 @@ In your jobs.rb
 ```ruby 
 require 'rescheduler'
 
-Rescheduler.job('ring-alerm') do |arg|
+Rescheduler.job('ring-alarm') do |arg|
   Music.find_by_name(arg[:song]).play
 end
 
@@ -15,7 +15,7 @@ Rescheduler.start # This starts the worker infinite loop
 
 To schedule the job
 ```ruby
-Rescheduler.enqueue(:queue=>'ring-alerm', :song=>'Jingle', :due_in => 600) # Use 10.minutes if using active support
+Rescheduler.enqueue(:queue=>'ring-alarm', :song=>'Jingle', :due_in => 600) # Use 10.minutes if using active support
 ```
 
 ## Installation
@@ -59,6 +59,7 @@ Other Features
 5. Class.perform style of runner definition(?)
 6. Other clients (Java etc.)
 7. Detection and recovery of dead workers
+8. Allow cherry-picking of jobs from special clients
 
 ### Non-goals
 
@@ -69,6 +70,8 @@ enqueue(options)
 Options:
 :due_at => time
 :due_in => number of seconds from now
+:due_every => number of seconds for the next job (specifies the time difference between start times, does not matter how long a job takes)
+:recur_daily => number of seconds since midnight. If this is a string, it will be converted to seconds by Time.parse('string').seconds_since_midnight
 :queue => Name of the queue (default if missing)
 :id => Uniquely identify the job within its queue. (Overwrites job with same id)
 [anything else] => passed over to runner
@@ -80,7 +83,6 @@ delete(options)
 exists?(options)
 :queue
 :id
-
 
 ### Configuration
 
