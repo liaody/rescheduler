@@ -1,5 +1,5 @@
 require 'time' # Needed for Time.parse
-require 'json'
+require 'multi_json'
 require 'redis'
 
 module Rescheduler
@@ -82,12 +82,28 @@ module Rescheduler
     end
   end
 
+  # NOTE: Use this with care. Some lost jobs can be moved to immediate queue instead of deleted
+  # Pass '*' to delete everything.
+  def purge_bad_jobs(queue = '*')
+    pending, running, deferred = redis.multi do 
+      redis.hkeys(rk_args)
+      redis.hkeys(rk_running)
+      redis.zrange(rk_deferred, 0, -1)
+    end
+
+    bad = pending - running - deferred
+    bad.each do |qnid| 
+      next if queue != '*' && !qnid.start_with?(queue + ':')
+      idelete(qnid)
+    end
+  end
+
   #==========================
   # Task producer routines
   # Add an immediate task to the queue
   def enqueue(options=nil)
     options ||= {}
-    now = Time.now
+    now = Time.now.to_i
 
     # Error check 
     validate_queue_name(options[:queue]) if options.include?(:queue)
@@ -105,7 +121,9 @@ module Rescheduler
       options[:id] = redis.incr(rk_counter)
     end
 
-    ts = options[:due_at].to_i || 0
+    ts = options[:due_at].to_i
+    ts = now if ts == 0 # 0 means immediate
+    options[:due_at] = ts # Convert :due_at to integer timestamp to be reused in recurrance
     qnid = get_qnid(options)
 
     # Encode and save args
@@ -116,10 +134,10 @@ module Rescheduler
       end
 
       # Save options
-      redis.hset(rk_args, qnid, options.to_json)
+      redis.hset(rk_args, qnid, MultiJson.dump(options))
 
       # Determine the due time
-      if ts > now.to_i # Future job
+      if ts > now # Future job
         redis.zadd(rk_deferred, ts, qnid)
       else
         redis.lpush(rk_queue(options[:queue]), qnid)
@@ -127,7 +145,7 @@ module Rescheduler
     end
 
     # Now decide if we need to wake up the workers (outside of the transaction)
-    if (ts > now.to_i)
+    if (ts > now)
       dt = redis.zrange(rk_deferred, 0, 0)[0]
       # Wake up workers if our job is the first one in deferred queue, so they can reset timeout
       if dt && dt == qnid
@@ -149,12 +167,7 @@ module Rescheduler
 
   def delete(options)
     qnid = get_qnid(options)
-    
-    redis.multi do
-      redis.hdel(rk_args, qnid)
-      redis.zrem(rk_deferred, qnid)
-      redis.lrem(rk_queue(options[:queue]), 0, qnid)
-    end
+    idelete(qnid)
   end
 
   # Make a job immediate if it is not already. Erase the wait
@@ -283,6 +296,16 @@ module Rescheduler
 
   private 
 
+  # Internal routines operating out of qnid
+  def idelete(qnid)
+    queue = qnid.split(':').first
+    redis.multi do
+      redis.hdel(rk_args, qnid)
+      redis.zrem(rk_deferred, qnid)
+      redis.lrem(rk_queue(queue), 0, qnid)
+    end
+  end
+
   # Runner routines
   def run_job(qnid)
     # 1. load job parameters for running
@@ -309,15 +332,12 @@ module Rescheduler
     end until res
 
     # Parse and run
-    opt = JSON.parse(optstr)
-    #opt.symbolize_keys # Be mindful of non-rails people, explicitly here
-    sopt = {}
-    opt.each { |key, val| sopt[key.to_sym] = val }
+    sopt = MultiJson.load(optstr, :symbolize_keys => true)
 
     # Handle parameters
-    if (sopt.include?(:due_every))
+    if (sopt.include?(:recur_every))
       newopt = sopt.dup
-      newopt[:due_at] = (sopt[:due_at] || Time.now) + sopt[:due_every]
+      newopt[:due_at] = (sopt[:due_at] || Time.now).to_i + sopt[:recur_every].to_i
       newopt.delete(:due_in) # In case the first job was specified by :due_in
       enqueue(newopt)
     end
@@ -453,9 +473,9 @@ module Rescheduler
 
   def validate_recurrance(options)
     rcnt = 0
-    if (options.include?(:due_every))
+    if (options.include?(:recur_every))
       rcnt += 1
-      raise 'Expect integer for :due_every parameter' unless options[:due_every].is_a?(Fixnum)
+      raise 'Expect integer for :recur_every parameter' unless options[:recur_every].is_a?(Fixnum)
     end
 
     if (options.include?(:recur_daily))
