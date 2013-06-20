@@ -9,10 +9,6 @@ module Rescheduler
   attr_accessor :config
   self.config = {}
 
-  # Debugging only (since initializers won't reload)
-  self.config[:prefix] = REDIS_PREFIX # This ensures cross DB deployment persistence
-  self.config[:redis] = RedisHelper.redis
-
   #==========================
   # Management routines
   def prefix
@@ -70,7 +66,7 @@ module Rescheduler
 
         unless quls # Retry
           log_debug('Contention during stats')
-          next 
+          return {:jobs=>{'Job contention'=>{}}}
         end
 
         qus.each_with_index do |k, idx|
@@ -339,6 +335,7 @@ module Rescheduler
       newopt = sopt.dup
       newopt[:due_at] = (sopt[:due_at] || Time.now).to_i + sopt[:recur_every].to_i
       newopt.delete(:due_in) # In case the first job was specified by :due_in
+      log_debug("---Enqueue #{qnid}: due_every #{sopt[:due_every]}")
       enqueue(newopt)
     end
 
@@ -346,6 +343,7 @@ module Rescheduler
       newopt = sopt.dup      
       newopt[:due_at] = time_from_recur_daily(sopt[:recur_daily])
       newopt.delete(:due_in) # In case the first job was specified by :due_in
+      log_debug("---Enqueue #{qnid}: due_daily #{sopt[:recur_daily]}")
       enqueue(newopt)
     end
 
@@ -396,20 +394,64 @@ module Rescheduler
 
         redis.multi
         redis.zremrangebyscore(dtn, 0, curtime)
+        to_push = {}
         tasks.each do |qnid|
-          q = qnid_to_queue(qnid)
-          redis.lpush(rk_queue(q), qnid)
+          q = rk_queue(qnid_to_queue(qnid))
+          to_push[q] ||= []
+          to_push[q] << qnid
         end
+
+        to_push.each do |q, qnids|
+          redis.lpush(q, qnids) # Batch command
+        end
+
         if !redis.exec
           # Contention happens, retrying
           # Sleep a random amount of time after first try
+          ntry += 1
           log_debug("service_deferred_jobs contention")
-          Kernel.sleep (rand(ntry * 1000) / 1000.0) if ntry > 0
+          Kernel.sleep (rand(ntry * 1000) / 1000.0)
         else
           return # Done transfering
         end
       end
-      ntry += 1
+
+      if ntry > 3 # Max number of tries
+        # Fall back to 
+        service_one_deferred_job
+        return
+      end
+    end
+  end
+
+  def service_one_deferred_jobs
+    dtn = rk_deferred # Make a copy in case prefix changes
+    ntry = 0
+    curtime = Time.now.to_i
+    loop do 
+      redis.watch(dtn) do
+        tasks = redis.zrangebyscore(dtn, 0, curtime, :limit=>[0,1])
+        if tasks.empty?
+          redis.unwatch
+          return # Nothing to transfer, moving on.
+        end
+
+        qnid = tasks[0]
+        q = qnid_to_queue(qnid)
+
+        redis.multi
+        redis.zrem(dtn, qnid)
+        redis.lpush(rk_queue(q), qnid)
+        if !redis.exec
+          # Contention happens, retrying
+          # Sleep a random amount of time after first try
+          log_debug("service_one_deferred_job contention")
+          ntry += 1
+          Kernel.sleep (rand(ntry * 1000) / 1000.0)
+        else
+          break # Done transfering one job
+        end
+      end
     end
   end
 

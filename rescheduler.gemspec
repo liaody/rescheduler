@@ -1,7 +1,7 @@
 
 Gem::Specification.new do |s|
   s.name        = 'rescheduler'
-  s.version     = '0.4.0'
+  s.version     = '0.4.1'
   s.date        = '2014-04-22'
   s.summary     = "A job queue for immediate and delayed jobs using Redis"
   s.description = "Rescheduler is a library that uses Redis to maintain a task queue of immediate and delayed jobs without polling."
