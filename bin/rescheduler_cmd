@@ -1,0 +1,33 @@
+#!/usr/bin/env ruby
+
+=begin
+rescheduler_cmd <options> cmd worker_name
+Options:
+  --prefix=<prefix>
+=end
+
+
+opts = {}
+while ARGV.size > 0 && ARGV[0][0..1] == '--'
+  opt,val = ARGV.shift[2..-1].split('=',2)
+  val ||= true
+  opts[opt] = val
+end
+
+cmd = ARGV.shift
+worker = ARGV.shift
+
+if !cmd || !worker
+  abort "Usage: rescheduler_cmd <cmd> <worker_name>"
+end
+
+# Load rescheduler
+require File.expand_path('../../lib/rescheduler', __FILE__)
+
+COMMANDS = %w[suspend resume stop start]
+ALLOWED_COMMANDS = COMMANDS + COMMANDS.map {|x| x + '_all' }
+
+abort "Unrecognized command #{cmd}" unless ALLOWED_COMMANDS.include?(cmd)
+print opts.inspect
+Rescheduler.config[:prefix] = opts['prefix'] if opts['prefix']
+Rescheduler::Worker.public_send cmd, worker

@@ -1,142 +1,206 @@
+require 'date'
 require 'time' # Needed for Time.parse
 require 'multi_json'
 require 'redis'
+
+require File.expand_path('../rescheduler/worker', __FILE__)
+
+=begin
+
+Immediate Queue:  "TMTUBE:queue"  - List of qnids
+Deferred Tasks:   "TMDEFERRED"    - Sorted set of all tasks based on their due date
+Task Args:        "TMARGS:qnid"   - JSON args of the task
+Running Tasks:    "TMRUNNING"     - ??
+
+Maintenane:       "TMMAINT"       - ?? An internal queue for maintenance jobs
+
+Worker Semaphore: "TMWORKERLOCK"  - Exclusion semaphore for worker maintenance
+Auto-increment Id:"TMCOUNTER"     - Global unique id generator
+
+Worker Registry:  "TMWORKERS"     - Map of workerid=>worker info
+=end
+
+# NOTE: We use class variables instead of class instance variables so that
+# "include Rescheduler" would work as intended for DSL definition
+
 
 module Rescheduler
   extend self
 
   # Setup configuration
-  attr_accessor :config
-  self.config = {}
-
-  #==========================
-  # Management routines
-  def prefix
-    return @config[:prefix] || ''
+  def config
+    @@config ||= { prefix:'' }
+    @@config
   end
 
-  def reinitialize # Very slow reinitialize
+  def config=(c); @@config = c; end
+
+  #====================================================================
+  # Global management / Query
+  #====================================================================
+  def prefix
+    return @@config[:prefix]
+  end
+
+  def reinitialize
     keys = %w{TMCOUNTER TMMAINT TMDEFERRED TMARGS TMRUNNING}.map {|p| prefix + p }
-    %w{TMTUBE:*}.each do |p|
+    %w{TMTUBE:* TMARGS:*}.each do |p|
       keys += redis.keys(prefix + p)
     end
     redis.del(keys)
   end
 
-  # Return a hash of statistics, in this format
-  # 
+  # Warning: Linear time operation (see #show_queue)
+  def delete_queue(queue)
+    entries = show_queue(queue)
+    return 0 if entries.blank?
+
+    entries.map do |entry|
+      idelete(get_qnid(queue, entry))
+    end.length
+  end
+
+  def fast_delete_immediate_queue(queue) # NOTE: only use this when there is no inserters around
+    argkeys = redis.keys(rk_args(get_qnid(queue, '*')))
+    redis.multi do
+      redis.del(argkeys)
+      redis.del(rk_queue(queue))
+    end
+    nil
+  end
+
+  # Return a hash of statistics
   def stats
-    loop do 
-      redis.watch(rk_args) do
-        stats = {}
-        qnids = redis.hkeys(rk_args)
-        # Get all the "pending jobs"
-        qnids.each do |qnid|
-          queue = qnid_to_queue(qnid)
-          stats[queue] ||= {}
-          stats[queue][:pending] ||= 0
-          stats[queue][:pending] += 1
-        end
+    stats = {}
+    @@runners ||= {}
+    @@runners.keys.each {|queue| stats[queue] = {} } unless @@runners.blank?
 
-        # Get all running
-        qnids = redis.hkeys(rk_running)
-        # Get all the "pending jobs"
-        qnids.each do |qnid|
-          queue = qnid_to_queue(qnid)
-          stats[queue] ||= {}
-          stats[queue][:running] ||= 0
-          stats[queue][:running] += 1
-        end
-
-        # Get all the deferred
-        deferred = redis.zrange(rk_deferred, 0, -1, :with_scores=>true)
-        deferred.each do |qnid, ts|
-          queue = qnid_to_queue(qnid)
-          stats[queue] ||= {}
-          stats[queue][:deferred] ||= 0
-          stats[queue][:deferred] += 1
-          stats[queue][:first] ||= ts # First is first
-        end        
-
-        # Get all the immediate
-        qus = stats.keys
-        quls = redis.multi do
-          qus.each { |queue| redis.llen(rk_queue(queue)) }
-        end
-
-        unless quls # Retry
-          log_debug('Contention during stats')
-          return {:jobs=>{'Job contention'=>{}}}
-        end
-
-        qus.each_with_index do |k, idx|
-          stats[k][:immediate] = quls[idx]
-        end
-
-        return {:jobs=>stats}
-      end
+    # Discover all immediate queues
+    ql = rk_queue('').length
+    redis.keys(rk_queue('*')).each do |rkqueue|
+      queue = rkqueue[ql..-1]
+      stats[queue] ||= {}
+      stats[queue][:immediate] = queue_length(queue)
     end
+
+    # Get all the deferred
+    deferred = redis.zrange(rk_deferred, 0, -1, :with_scores=>true)
+    deferred.each do |qnid, ts|
+      queue = qnid_to_queue(qnid)
+      stats[queue] ||= {}
+      stats[queue][:deferred] ||= 0
+      stats[queue][:deferred] += 1
+      stats[queue][:first] ||= ts # First is first
+    end
+
+    # Get all the immediate
+    return {:jobs=>stats, :workers=>Worker.stats}
   end
 
-  # NOTE: Use this with care. Some lost jobs can be moved to immediate queue instead of deleted
-  # Pass '*' to delete everything.
-  def purge_bad_jobs(queue = '*')
-    pending, running, deferred = redis.multi do 
-      redis.hkeys(rk_args)
-      redis.hkeys(rk_running)
-      redis.zrange(rk_deferred, 0, -1)
-    end
-
-    bad = pending - running - deferred
-    bad.each do |qnid| 
-      next if queue != '*' && !qnid.start_with?(queue + ':')
-      idelete(qnid)
-    end
+  #----------------------------------------------
+  # Queue management
+  #----------------------------------------------
+  # Returns number of jobs waiting to be handled in a queue (all immediate jobs)
+  def queue_length(queue)
+    return redis.llen(rk_queue(queue))
   end
 
-  #==========================
+  # Reads a background job and returns its properties; returns nil if the job does not exist
+  # Takes :queue and :id as arguments
+  def peek(options)
+    qnid = get_qnid(options[:queue], options[:id])
+    optstr = redis.get(rk_args(qnid))
+    return nil unless optstr
+    sopt = MultiJson.load(optstr, :symbolize_keys => true)
+    sopt[:queue] = options[:queue]
+    sopt[:id] = options[:id]
+    return sopt
+  end
+
+  # Warning: Linear time operation, where n is the number if items in all the queues
+  def show_queue(queue)
+    qstr = ":#{queue}:"
+    # TODO: Use SCAN after upgrade to Redis 2.8
+    redis.keys(rk_args(get_qnid(queue, '*'))).map {|k| k.split(qstr, 2).last }
+  end
+
+  #----------------------------------------------
+  # Task management
+  #----------------------------------------------
+
+  # Check existence of one task
+  def exists?(options)
+    raise ArgumentError, 'Can not test existence without :id' unless options.include?(:id)
+    qnid = get_qnid(options[:queue], options[:id])
+    return redis.exists(rk_args(qnid))
+  end
+
+  # Delete one task
+  def delete(options)
+    qnid = get_qnid(options[:queue], options[:id])
+    idelete(qnid)
+  end
+
+  #====================================================================
   # Task producer routines
+  #====================================================================
   # Add an immediate task to the queue
   def enqueue(options=nil)
-    options ||= {}
+    internal_enqueue(options, false)
+  end
+
+  def enqueue_to_top(options = nil)
+    internal_enqueue(options, true)
+  end
+
+  def internal_enqueue(options, push_to_top)
+    sopt = options ? options.dup : {}
+    queue = sopt[:queue] || '' # Default queue name is ''
+    has_id = sopt.include?(:id)
+    job_id = sopt[:id] || redis.incr(rk_counter) # Default random unique id
+
     now = Time.now.to_i
 
-    # Error check 
-    validate_queue_name(options[:queue]) if options.include?(:queue)
-    validate_recurrance(options)
+    # Error check
+    validate_queue_name(queue)
+    validate_recurrance(sopt)
 
     # Convert due_in to due_at
-    if options.include?(:due_in)
-      raise ArgumentError, ':due_in and :due_at can not be both specified' if options.include?(:due_at)
-      options[:due_at] = now + options[:due_in]
+    if sopt.include?(:due_in)
+      # log_debug 'Both due_in and due_at specified, favoring due_in' if sopt.include?(:due_at)
+      sopt[:due_at] = now + sopt[:due_in]
     end
 
-    # Get an ID if not already have one     
-    user_id = options.include?(:id)
-    unless user_id
-      options[:id] = redis.incr(rk_counter)
-    end
+    qnid = get_qnid(queue, job_id)
 
-    ts = options[:due_at].to_i
-    ts = now if ts == 0 # 0 means immediate
-    options[:due_at] = ts # Convert :due_at to integer timestamp to be reused in recurrance
-    qnid = get_qnid(options)
+    ts = sopt[:due_at].to_i
+    if ts == 0 || ts < now # immediate
+      ts = now
+      sopt.delete(:due_at)
+    else
+      raise ArgumentError, 'Can not enqueue_to_top deferred jobs' if push_to_top
+      sopt[:due_at] = ts # Convert :due_at to integer timestamp to be reused in recurrance
+    end
 
     # Encode and save args
     redis.multi do # Transaction to enqueue the job and save args together
-      if user_id # Delete possible existing job if user set id
+      if has_id # Delete possible existing job if user set id
         redis.zrem(rk_deferred, qnid)
-        redis.lrem(rk_queue(options[:queue]), 0, qnid)
+        redis.lrem(rk_queue(queue), 0, qnid) # This is going to be slow for long queues
       end
 
-      # Save options
-      redis.hset(rk_args, qnid, MultiJson.dump(options))
+      # Save args even if it is empty (for existence checks)
+      redis.set(rk_args(qnid), MultiJson.dump(sopt))
 
       # Determine the due time
       if ts > now # Future job
         redis.zadd(rk_deferred, ts, qnid)
       else
-        redis.lpush(rk_queue(options[:queue]), qnid)
+        if push_to_top
+          redis.rpush(rk_queue(queue), qnid)
+        else
+          redis.lpush(rk_queue(queue), qnid)
+        end
       end
     end
 
@@ -151,103 +215,71 @@ module Rescheduler
     nil
   end
 
-  def exists?(options)
-    raise ArgumentError, 'Can not test existence without :id' unless options.include?(:id)
-    qnid = get_qnid(options)
-    return redis.hexists(rk_args, qnid)
-  end
-
-  def enqueue_unless_exists(options)
-    enqueue(options) unless exists?(options)
-  end
-
-  def delete(options)
-    qnid = get_qnid(options)
-    idelete(qnid)
-  end
-
-  # Make a job immediate if it is not already. Erase the wait
-  def make_immediate(options)
-    dtn = rk_deferred # Make a copy in case prefix changes
-    qnid = get_qnid(options)
-    ntry = 0
-    loop do
-      redis.watch(dtn) do 
-        if redis.zcard(dtn, qnid) == 0
-          redis.unwatch(dtn)
-          return # Not a deferred job
-        else
-          redis.multi
-          redis.zrem(dtn, qnid)
-          q = qnid_to_queue(qnid)
-          redis.lpush(rk_queue(q), qnid)
-          if !redis.exec
-            # Contention happens, retrying
-            log_debug("make_immediate contention for #{qnid}")
-            Kernel.sleep (rand(ntry * 1000) / 1000.0) if ntry > 0
-          else
-            return # Done
-          end
-        end
+  # Temp function for special purpose. Completely by-pass concurrency check to increase speed
+  def quick_enqueue_batch(queue, ids, reset = false)
+    argsmap = {}
+    vals = []
+    ids.each do |id|
+      qnid = get_qnid(queue, id)
+      vals << qnid
+      argsmap[rk_args(qnid)] = '{}' # Empty args
+    end unless ids.blank?
+    redis.pipelined do # Should do redis.multi if concurrency is a problem
+      redis.del(rk_queue(queue)) if reset # Empty the list fast
+      unless ids.blank?
+        redis.lpush(rk_queue(queue), vals)
+        argsmap.each { |k,v| redis.set(k,v) }
       end
-      ntry += 1
     end
+    nil
   end
 
-  #=================
-  # Serialization (in case it is needed to transfer all Rescheduler across to another redis instance)
-
-  # Atomically save the state to file and stop all workers (state in redis is not destroyed)
-  # This function can take a while as it will wait for running jobs to finish first.
-  def serialize_and_stop(filename)
-    # TODO
+  # Returns true if enqueued a new job, otherwise returns false
+  def enqueue_unless_exists(options)
+    # NOTE: There is no point synchronizing exists and enqueue
+    return false if exists?(options)
+    enqueue(options)
+    return true
   end
 
-  # Load state from a file. Will merge into existing jobs if there are any (make sure it is done only once)
-  # This can be done before any worker starts, or after. 
-  # Workers still need to be manually started
-  def deserialize(filename)
-    # TODO
-  end
-
-  # Clear redis states and delete all jobs (useful before deserialize)
-  def erase_all
-    # TODO
-  end
-
-  #=================
+  #====================================================================
   # Job definition
+  #====================================================================
+
   # Task consumer routines
   def job(tube, &block)
-    @runners ||= {}
-    @runners[tube] = block
+    @@runners ||= {}
+    @@runners[tube] = block
     return nil
   end
 
-  #=================
+  #====================================================================
   # Error handling
+  #====================================================================
   def on_error(tube=nil, &block)
     if tube != nil
-      @error_handlers ||= {}
-      @error_handlers[tube] = block
+      @@error_handlers ||= {}
+      @@error_handlers[tube] = block
     else
-      @global_error_handler = block;
+      @@global_error_handler = block;
     end
   end
-  #=================
+
+  #====================================================================
   # Runner/Maintenance routines
+  #====================================================================
   def start(*tubes)
     # Check arguments
-    if !@runners || @runners.size == 0
+    if !@@runners || @@runners.size == 0
       raise Exception, 'Can not start worker without defining job handlers.'
     end
 
     tubes.each do |t|
-      next if @runners.include?(t)
+      next if @@runners.include?(t)
       raise Exception, "Handler for queue #{t} is undefined."
     end
 
-    tubes = @runners.keys if !tubes || tubes.size == 0
+    tubes = @@runners.keys if !tubes || tubes.size == 0
 
     log_debug "[[ Starting: #{tubes.join(',')} ]]"
 
@@ -257,20 +289,33 @@ module Rescheduler
     keys = tubes.map {|t| rk_queue(t)}
     keys << rk_maintenace
 
+    # Queue to control a named worker
+    worker_queue = Worker.rk_queue if Worker.named?
+    keys.unshift(worker_queue) if worker_queue # worker control queue is the first we respond to
+
     dopush = nil
 
-    loop do
+    @@end_job_loop = false
+    while !@@end_job_loop
       # Run maintenance and determine timeout
       next_job_time = determine_next_deferred_job_time.to_i
 
       if dopush # Only pass-on the token after we are done with maintenance. Avoid contention
-        redis.lpush(rk_maintenace, dopush) 
+        redis.lpush(rk_maintenace, dopush)
         dopush = nil
       end
 
       # Blocking wait
       timeout = next_job_time - Time.now.to_i
       timeout = 1 if timeout < 1
+
+      # A producer may insert another job after BRPOP and before WATCH
+      # Due to limitations of BRPOP we can not prevent this from happening.
+      # When it happens we will consume the args of the later job, causing
+      # the newly inserted job to be "promoted" to the front of the queue
+      # This may not be desirable...
+      # (too bad BRPOPLPUSH does not support multiple queues...)
+      # TODO: Maybe LUA script is the way out of this.
       result = redis.brpop(keys, :timeout=>timeout)
 
       # Handle task
@@ -278,25 +323,39 @@ module Rescheduler
         tube = result[0]
         qnid = result[1]
         if tube == rk_maintenace
-          # Circulate maintenance task until it comes a full circle. This depends on redis 
-          # first come first serve policy in brpop. 
+          # Circulate maintenance task until it comes a full circle. This depends on redis
+          # first come first serve policy in brpop.
           dopush = qnid + client_key unless qnid.include?(client_key) # Push if we have not pushed yet.
+        elsif tube == worker_queue
+          Worker.handle_command(qnid)
         else
           run_job(qnid)
         end
-      else 
+      else
         # Do nothing when got timeout, the run_maintenance will take care of deferred jobs
       end
     end
   end
 
-  private 
+  def end_job_loop; @@end_job_loop = true; end
+
+
+  # Logging facility
+  def log_debug(msg)
+    return if config[:silent]
+    print("#{Time.now.iso8601} #{msg}\n")
+    STDOUT.flush
+  end
+
+  #====================================================================
+  private
+  #====================================================================
 
   # Internal routines operating out of qnid
   def idelete(qnid)
     queue = qnid.split(':').first
     redis.multi do
-      redis.hdel(rk_args, qnid)
+      redis.del(rk_args(qnid))
       redis.zrem(rk_deferred, qnid)
       redis.lrem(rk_queue(queue), 0, qnid)
     end
@@ -306,74 +365,70 @@ module Rescheduler
   def run_job(qnid)
     # 1. load job parameters for running
     optstr = nil
-    begin
-      res = nil
-      # Note: We use a single key to watch, can be improved by having a per-job key, 
-      redis.watch(rk_args) do # Transaction to ensure read/delete is atomic
-        optstr = redis.hget(rk_args, qnid)        
-        if optstr.nil?
-          redis.unwatch
-          log_debug("Job is deleted mysteriously")
-          return # Job is deleted somewhere
-        end
-        res = redis.multi do 
-          redis.hdel(rk_args, qnid)
-          redis.hset(rk_running, qnid, optstr)
-        end
-        if !res
-          # Contention, try read again
-          log_debug("Job read contention: (#{qnid})")
-        end
-      end
-    end until res
+    key = rk_args(qnid)
+    # Atomic get and delete the arg
+    redis.multi do
+      optstr = redis.get(key)
+      redis.del(key)
+    end
+
+    optstr = optstr.value # get the value from the multi block future
+    if optstr.nil?
+      log_debug("Job is deleted mysteriously: (#{qnid})")
+      return # Job is deleted somewhere
+    end
 
     # Parse and run
     sopt = MultiJson.load(optstr, :symbolize_keys => true)
+    queue,id = qnid.split(':', 2)
+    sopt[:queue] ||= queue
+    sopt[:id] ||= id
 
     # Handle parameters
     if (sopt.include?(:recur_every))
       newopt = sopt.dup
       newopt[:due_at] = (sopt[:due_at] || Time.now).to_i + sopt[:recur_every].to_i
       newopt.delete(:due_in) # In case the first job was specified by :due_in
-      log_debug("---Enqueue #{qnid}: due_every #{sopt[:due_every]}")
+      log_debug("---Enqueue #{qnid}: recur_every #{sopt[:recur_every]}")
       enqueue(newopt)
     end
 
-    if (sopt.include?(:recur_daily))
-      newopt = sopt.dup      
-      newopt[:due_at] = time_from_recur_daily(sopt[:recur_daily])
-      newopt.delete(:due_in) # In case the first job was specified by :due_in
-      log_debug("---Enqueue #{qnid}: due_daily #{sopt[:recur_daily]}")
+    if (sopt.include?(:recur_daily) || sopt.include?(:recur_weekly))
+      newopt = sopt.dup
+      newopt.delete(:due_at)
+      newopt.delete(:due_in) # No more due info, just the recurrance
+      log_debug("---Enqueue #{qnid}: recur_daily #{sopt[:recur_daily]}") if sopt.include?(:recur_daily)
+      log_debug("---Enqueue #{qnid}: recur_weekly #{sopt[:recur_weekly]}") if sopt.include?(:recur_weekly)
       enqueue(newopt)
     end
 
     # 2. Find runner and invoke it
     begin
       log_debug(">>---- Starting #{qnid}")
-      runner = @runners[qnid_to_queue(qnid)]
+      runner = @@runners[qnid_to_queue(qnid)]
       if runner.is_a?(Proc)
         runner.call(sopt)
         log_debug("----<< Finished #{qnid}")
+        Worker.inc_job_count # Stats for the worker
       else
         log_debug("----<< Failed #{qnid}: Unknown queue name, handler not defined")
       end
     rescue Exception => e
       log_debug("----<< Failed #{qnid}: -------------\n #{$!}")
       log_debug(e.backtrace[0..4].join("\n"))
-      handle_error(e, qnid, sopt)
+      handle_error(e, queue, sopt)
       log_debug("------------------------------------\n")
     end
-
-    # 3. Remove job from running list (Done)
-    redis.hdel(rk_running, qnid)
   end
 
-  def handle_error(e, qnid, sopt)
-    error_handler = @error_handlers && @error_handlers[qnid]
+  def handle_error(e, queue, sopt)
+    @@error_handlers ||= {}
+    @@global_error_handler ||= nil
+    error_handler = @@error_handlers[queue]
     if error_handler
-      error_handler.call(e, sopt) 
-    elsif @global_error_handler
-      @global_error_handler.call(e, sopt) 
+      error_handler.call(e, sopt)
+    elsif @@global_error_handler
+      @@global_error_handler.call(e, sopt)
     end
   end
 
@@ -383,23 +438,27 @@ module Rescheduler
   def service_deferred_jobs
     dtn = rk_deferred # Make a copy in case prefix changes
     ntry = 0
-    loop do
+    while ntry < 6 do
       curtime = Time.now.to_i
+      return if redis.zcount(dtn, 0, curtime) == 0
+
+      limit = ntry < 3 ? 100 : 1 # After first 3 tries, do just 1
       redis.watch(dtn) do
-        tasks = redis.zrangebyscore(dtn, 0, curtime)
+        tasks = redis.zrangebyscore(dtn, 0, curtime, :limit=>[0,limit]) # Serve at most 100
         if tasks.empty?
           redis.unwatch
           return # Nothing to transfer, moving on.
         end
 
-        redis.multi
-        redis.zremrangebyscore(dtn, 0, curtime)
         to_push = {}
         tasks.each do |qnid|
           q = rk_queue(qnid_to_queue(qnid))
           to_push[q] ||= []
           to_push[q] << qnid
         end
+
+        redis.multi
+        redis.zrem(dtn, tasks)
 
         to_push.each do |q, qnids|
           redis.lpush(q, qnids) # Batch command
@@ -409,63 +468,30 @@ module Rescheduler
           # Contention happens, retrying
           # Sleep a random amount of time after first try
           ntry += 1
-          log_debug("service_deferred_jobs contention")
+          log_debug("service_deferred_jobs(#{limit}) contention")
           Kernel.sleep (rand(ntry * 1000) / 1000.0)
         else
           return # Done transfering
         end
       end
-
-      if ntry > 3 # Max number of tries
-        # Fall back to 
-        service_one_deferred_job
-        return
-      end
     end
-  end
 
-  def service_one_deferred_jobs
-    dtn = rk_deferred # Make a copy in case prefix changes
-    ntry = 0
-    curtime = Time.now.to_i
-    loop do 
-      redis.watch(dtn) do
-        tasks = redis.zrangebyscore(dtn, 0, curtime, :limit=>[0,1])
-        if tasks.empty?
-          redis.unwatch
-          return # Nothing to transfer, moving on.
-        end
-
-        qnid = tasks[0]
-        q = qnid_to_queue(qnid)
-
-        redis.multi
-        redis.zrem(dtn, qnid)
-        redis.lpush(rk_queue(q), qnid)
-        if !redis.exec
-          # Contention happens, retrying
-          # Sleep a random amount of time after first try
-          log_debug("service_one_deferred_job contention")
-          ntry += 1
-          Kernel.sleep (rand(ntry * 1000) / 1000.0)
-        else
-          break # Done transfering one job
-        end
-      end
-    end
+    log_debug("service_deferred_jobs failed, will try next time")
   end
 
   def determine_next_deferred_job_time(skip_service = nil)
     tsnow = Time.now.to_f
-    maxtime = tsnow + 3600
+    maxtime = tsnow + 3600 + rand(100) # Randomize wake time to avoid multi worker service contention
 
     dt = redis.zrange(rk_deferred, 0, 0, :with_scores=>true)[0]
     nt = (dt && dt[1] && dt[1] < maxtime) ? dt[1] : maxtime
     if !skip_service && nt <= tsnow
-      service_deferred_jobs
-      # Get the deferred jobs again.
-      dt = redis.zrange(rk_deferred, 0, 0, :with_scores=>true)[0]
-      nt = (dt && dt[1] && dt[1] < maxtime) ? dt[1] : maxtime
+      do_if_can_acquire_semaphore do
+        service_deferred_jobs
+        # Get the deferred jobs again.
+        dt = redis.zrange(rk_deferred, 0, 0, :with_scores=>true)[0]
+        nt = (dt && dt[1] && dt[1] < maxtime) ? dt[1] : maxtime
+      end
     end
     return nt
   end
@@ -474,43 +500,92 @@ module Rescheduler
 
   def rk_deferred; prefix + 'TMDEFERRED'; end
   def rk_maintenace; prefix + 'TMMAINT'; end
-  def rk_args; prefix + "TMARGS"; end
-  def rk_running; prefix + "TMRUNNING"; end
+  def rk_args(qnid); "#{prefix}TMARGS:#{qnid}"; end
   def rk_counter; prefix + 'TMCOUNTER'; end
+  def rk_worker_semaphore; prefix + 'TMWORKERLOCK'; end # This is a boolean with a timeout for workers to exclude each other
 
-  def get_qnid(options)
-    return "#{options[:queue]}:#{options[:id]}"
+  # None blocking, returns true if semaphore is acquired (for a given timeout), this is cooperative to avoid guaranteed contentions
+  def try_acquire_semaphore(timeout=300) # Default for 5 minutes, there must be a timeout
+    semkey = rk_worker_semaphore
+    if redis.setnx(semkey, 1) # Any value would be fine
+      redis.expire(semkey, timeout)
+      return true
+    else
+      # Already created, someone has it
+      return false
+    end
   end
+
+  # This releases semaphore unconditionally
+  def release_semaphore
+    # NOTE: There is a chance we remove the lock created by another worker after our own expired.
+    # This is OK since the lock is cooperative and not necessary (real locking is done through contention checks)
+    redis.del(rk_worker_semaphore)
+  end
+
+  # Run block only if the semaphore can be acquired, otherwise do nothing
+  def do_if_can_acquire_semaphore
+    if try_acquire_semaphore
+      yield
+      release_semaphore
+    end
+  end
+
+  def get_qnid(queue, id); return "#{queue}:#{id}"; end
 
   def qnid_to_queue(qnid)
     idx = qnid.index(':')
     unless idx
       log_debug("Invalid qnid: #{qnid}")
-      return nil 
+      return nil
     end
     qnid[0...idx]
   end
 
   def redis
-    @redis ||= @config[:redis] || Redis.new(@config[:redis_connection] || {})
+    @@redis ||= config[:redis] || Redis.new(config[:redis_connection] || {})
   end
 
   def validate_queue_name(queue)
     raise ArgumentError, 'Queue name can not contain special characters' if queue.include?(':')
   end
 
-  def parse_seconds_of_day(recur_daily)
-    return recur_daily if recur_daily.is_a?(Fixnum)
-    time = Time.parse(recur_daily)
-    return time.to_i - Time.new(time.year, time.month, time.day).to_i
-  end
-
   # Find the next recur time
   def time_from_recur_daily(recur_daily, now = Time.now)
-    recur = parse_seconds_of_day(recur_daily)
-    t = Time.new(now.year, now.month, now.day).to_i + recur
-    t += 86400 if t < now.to_i
-    return Time.at(t)
+    parsed = Date._parse(recur_daily)
+    if !parsed[:hour] || (parsed.keys - [:zone, :hour, :min, :sec, :offset, :sec_fraction]).present?
+      raise ArgumentError, 'Unexpected recur_daily value: ' + recur_daily
+    end
+
+    if !parsed[:offset]
+      raise ArgumentError, 'A timezone is required for recur_daily: ' + recur_daily
+    end
+
+    # Never offset over one day (e.g. 23:59 PDT)
+    offset = (parsed[:hour] * 3600 + (parsed[:min]||0) * 60 + (parsed[:sec] || 0) - parsed[:offset]) % 86400
+
+    t = Time.utc(now.year, now.month, now.day) + offset
+    t += 86400 if t <= now + 1
+    return t
+  end
+
+  def time_from_recur_weekly(recur_weekly, now = Time.now)
+    parsed = Date._parse(recur_weekly)
+    if !parsed[:hour] || !parsed[:wday] || (parsed.keys - [:wday, :zone, :hour, :min, :sec, :offset, :sec_fraction]).present?
+      raise ArgumentError, 'Unexpected recur_weekly value: ' + recur_weekly
+    end
+
+    if !parsed[:offset]
+      raise ArgumentError, 'A timezone is required for recur_weekly: ' + recur_weekly
+    end
+
+    # Never offset over one week
+    offset = parsed[:hour] * 3600 + (parsed[:min]||0) * 60 + (parsed[:sec] || 0) - parsed[:offset]
+    offset = (offset + parsed[:wday] * 86400) % (86400 * 7)
+
+    t = Time.utc(now.year, now.month, now.day) - now.wday * 86400 + offset
+    t += 86400 * 7 if t <= now + 1
+    return t
   end
 
   def validate_recurrance(options)
@@ -527,14 +602,16 @@ module Rescheduler
         options[:due_at] = time # Setup the first run
       end
     end
-    raise 'Can only specify one recurrance parameter' if rcnt > 1
-  end
 
-  # Logging facility
-  def log_debug(msg)
-    return if @config[:silent]
-    print("#{Time.now.iso8601} #{msg}\n")
-    STDOUT.flush
+    if (options.include?(:recur_weekly))
+      rcnt += 1
+      time = time_from_recur_weekly(options[:recur_weekly]) # Try parse and make sure we can
+      unless options.include?(:due_at) || options.include?(:due_in)
+        options[:due_at] = time # Setup the first run
+      end
+    end
+
+    raise 'Can only specify one recurrance parameter' if rcnt > 1
   end
 
 end

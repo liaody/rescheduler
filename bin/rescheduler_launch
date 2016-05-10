@@ -1,0 +1,50 @@
+#!/usr/bin/env ruby
+=begin
+rescheduler_launch <options> [<worker_name> <jobs.rb>]
+Options:
+  --rails=<folder>    Use rails environment from the givne folder
+  --log=<file>        Specify logfile (in Rails mode default to <rails_foler>/log/<worker_name>.log)
+  --env=<env>         Set these ENV into the new process
+  --debug             Do not daemonize or redirect output, work with current STDOUT
+  --respawn_jobs=N    Respawn worker after N jobs
+  --respawn_time=N    Respawn every N seconds (NOTE: Only will respawn after finish a job)
+Internal purpose only:
+  --respawn           Set to indicate this is a respawn of the named worker and will take over the
+                      name without deleting stats
+=end
+
+# First parse options
+opts = {}
+while ARGV.size > 0 && ARGV[0][0..1] == '--'
+  opt,val = ARGV.shift[2..-1].split('=',2)
+  val ||= true
+  opts[opt] = val
+end
+
+opts['worker_name'] = ARGV.shift
+opts['worker_file'] = ARGV.shift
+
+abort "rescheduler_launch <options> <worker_name> <jobs.rb>" unless opts['worker_file'] && File.exists?(opts['worker_file'])
+
+# Daemonize first before we load rails
+begin
+  Process.daemon unless opts['debug'] # Do not daemonize if debugging
+rescue NotImplementedError
+  # This happens in windows, it is OK
+end
+
+# Load rails environment if --rails is specified
+require File.join(opts['rails'], 'config/environment.rb') if opts['rails']
+
+# Load rescheduler
+require File.expand_path('../../lib/rescheduler', __FILE__)
+
+Rescheduler::Worker.register(opts)
+Rescheduler::Worker.redirect_logging(opts) unless opts['debug']
+
+# Running the job file
+begin
+  Kernel.load opts['worker_file']
+ensure
+  Rescheduler::Worker.unregister unless Rescheduler::Worker.respawn_if_requested
+end
