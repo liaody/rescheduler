@@ -4,6 +4,7 @@ require 'multi_json'
 require 'redis'
 
 require File.expand_path('../rescheduler/worker', __FILE__)
+require File.expand_path('../rescheduler/sync', __FILE__)
 
 =begin
 
@@ -269,8 +270,9 @@ module Rescheduler
   # Runner/Maintenance routines
   #====================================================================
   def start(*tubes)
+    @@runners ||= {}
     # Check arguments
-    if !@@runners || @@runners.size == 0
+    if @@runners.size == 0
       raise Exception, 'Can not start worker without defining job handlers.'
     end
 
@@ -592,7 +594,7 @@ module Rescheduler
     rcnt = 0
     if (options.include?(:recur_every))
       rcnt += 1
-      raise 'Expect integer for :recur_every parameter' unless options[:recur_every].is_a?(Fixnum)
+      raise 'Expect integer for :recur_every parameter' unless options[:recur_every].is_a?(Integer)
     end
 
     if (options.include?(:recur_daily))

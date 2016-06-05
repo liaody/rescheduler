@@ -9,6 +9,7 @@ module Rescheduler
     CMD_OPTS = %w[rails log env respawn] # respanw is for internal only
     attr_accessor :launch_options
     def worker_name; @launch_options && @launch_options['worker_name']; end
+    def worker_index; @launch_options && @launch_options['worker_index'] || -1; end
     # ====================================================================
     # Controller
     # ====================================================================
@@ -149,7 +150,7 @@ module Rescheduler
       name_pattern = opt['worker_name']
 
       last_wname = nil
-      widx = 0
+      widx = 0 # We do not preserve worker_index upon respawn
       wname = nil
       if opt['respawn']
         wname = name_pattern
@@ -169,6 +170,7 @@ module Rescheduler
         end
       end
       @launch_options['worker_name'] = wname # Save this in launch options
+      @launch_options['worker_index'] = widx # Sequence of the same worker
       @launch_options['pid'] = Process.pid
       @launch_options['machine'] = Socket.gethostname
 

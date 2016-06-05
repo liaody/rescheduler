@@ -1,3 +1,8 @@
+0.5.1
+-----
+* worker_index for lockless synchronization
+* Explicit locking through Rescheduler::Sync
+
 0.5.0
 -----
 * Rescheduler::Worker support routines and binary

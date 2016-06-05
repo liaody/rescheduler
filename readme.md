@@ -3,7 +3,7 @@
 ## Example (pure ruby)
 In your jobs.rb
 
-```ruby 
+```ruby
 require 'rescheduler'
 
 Rescheduler.job('ring-alarm') do |arg|
@@ -38,7 +38,7 @@ rescheduler_launch worker% jobs.rb
   gem install rescheduler
 ```
 ## Dependency
-  
+
 * Redis 2.4 or above
 * Redis ruby client (https://github.com/redis/redis-rb)
 * MultiJson (https://github.com/intridea/multi_json)
@@ -47,7 +47,7 @@ rescheduler_launch worker% jobs.rb
 1. Based solely on Redis. Can configure connection, db, prefix.
 2. Immediate response time for immediate jobs. (Event machine style, no polling)
 3. CPU idle when there is no job. (Block waiting, no polling)
-4. Light weight and low setup. Queues automatically maintained by workers. 
+4. Light weight and low setup. Queues automatically maintained by workers.
 5. "id" supports querying, overwriting and removing of pending jobs.
 
 ### TODO later
