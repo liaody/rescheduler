@@ -1,3 +1,8 @@
+0.5.2
+-----
+* Fix logging with bad unicode
+* Fix worker_index problem
+
 0.5.1
 -----
 * worker_index for lockless synchronization

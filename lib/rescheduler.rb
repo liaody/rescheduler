@@ -345,6 +345,7 @@ module Rescheduler
   # Logging facility
   def log_debug(msg)
     return if config[:silent]
+    msg = msg.encode('UTF-8', invalid: :replace, undef: :replace)
     print("#{Time.now.iso8601} #{msg}\n")
     STDOUT.flush
   end
