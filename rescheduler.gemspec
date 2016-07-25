@@ -10,9 +10,9 @@ Gem::Specification.new do |s|
   s.files       = ["lib/rescheduler.rb", "lib/rescheduler/worker.rb", "lib/rescheduler/sync.rb"]
   s.executables = ['rescheduler_launch']
   s.homepage    = 'https://github.com/liaody/rescheduler'
-  s.license     = 'BSD'
+  s.license     = 'MIT'
 
-  s.add_runtime_dependency 'redis'
-  s.add_runtime_dependency 'multi_json'
+  s.add_runtime_dependency 'redis', '~> 0'
+  s.add_runtime_dependency 'multi_json', '~> 0'
   #s.add_runtime_dependency 'sinatra' # For rescheduler/server only
 end
