@@ -42,6 +42,9 @@ require File.expand_path('../../lib/rescheduler', __FILE__)
 Rescheduler::Worker.register(opts)
 Rescheduler::Worker.redirect_logging(opts) unless opts['debug']
 
+Rescheduler.log_debug "[#{Rescheduler::Worker.worker_name}] Launching"
+
+
 # Running the job file
 begin
   Kernel.load opts['worker_file']

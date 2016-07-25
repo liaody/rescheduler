@@ -147,16 +147,16 @@ module Rescheduler
 
     def register(opt)
       @launch_options = opt # Save for respawning
-      name_pattern = opt['worker_name']
-
-      last_wname = nil
-      widx = 0 # We do not preserve worker_index upon respawn
-      wname = nil
-      if opt['respawn']
-        wname = name_pattern
+      if @launch_options['respawn']
+        wname = @launch_options['worker_name']
         # Reset created for respawn purposes.
         redis.hset(rk_worker(wname), 'created', Time.now.to_i)
       else
+        name_pattern = @launch_options['worker_name']
+
+        widx = 0 # We do not preserve worker_index upon respawn
+        wname = nil
+        last_wname = nil
         loop do
           wname = name_pattern.gsub('%', widx.to_s)
           if wname == last_wname # For the name without %, we add one to the end if clashes
@@ -168,9 +168,9 @@ module Rescheduler
           widx += 1
           last_wname = wname
         end
+        @launch_options['worker_name'] = wname # Save this in launch options
+        @launch_options['worker_index'] = widx # Sequence of the same worker
       end
-      @launch_options['worker_name'] = wname # Save this in launch options
-      @launch_options['worker_index'] = widx # Sequence of the same worker
       @launch_options['pid'] = Process.pid
       @launch_options['machine'] = Socket.gethostname
 
