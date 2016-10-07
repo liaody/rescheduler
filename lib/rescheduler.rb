@@ -98,6 +98,34 @@ module Rescheduler
     return {:jobs=>stats, :workers=>Worker.stats}
   end
 
+  def eta(sample_time = 30)
+    print "Measuring ... "
+    jobs1 = stats[:jobs]
+    start = Time.zone.now
+    sleep sample_time
+    stop = Time.zone.now
+    jobs2 = stats[:jobs]
+    print "done!\n"
+
+    secs = stop - start
+    jobs = {}
+    jobs1.select {|k, v| (v[:immediate] || 0) > 1}.keys.each do |job|
+      j1_i = jobs1[job][:immediate]
+      j2_i = (jobs2[job] || {})[:immediate] || 0
+      diff = j1_i - j2_i
+      if diff == 0
+        jobs[job] = "No progress"
+      elsif diff < 0
+        jobs[job] = "Negative progress. Queue size increased."
+      else
+        secs_per_job = secs/diff.to_f
+        remaining = jobs2[job][:immediate] * secs_per_job
+        jobs[job] = {per_job: '%.2f' % secs_per_job, remaining: '%.2f' % remaining}
+      end
+    end
+    jobs
+  end
+
   #----------------------------------------------
   # Queue management
   #----------------------------------------------
@@ -276,6 +304,9 @@ module Rescheduler
       raise Exception, 'Can not start worker without defining job handlers.'
     end
 
+    start_opts = {}
+    start_opts = tubes.pop if tubes.last.is_a?(Hash)
+
     tubes.each do |t|
       next if @@runners.include?(t)
       raise Exception, "Handler for queue #{t} is undefined."
@@ -288,12 +319,8 @@ module Rescheduler
     # Generate a random clientkey for maintenance token ring maintenance.
     client_key = [[rand(0xFFFFFFFF)].pack('L')].pack('m0')[0...6]
 
-    keys = tubes.map {|t| rk_queue(t)}
-    keys << rk_maintenace
-
-    # Queue to control a named worker
     worker_queue = Worker.rk_queue if Worker.named?
-    keys.unshift(worker_queue) if worker_queue # worker control queue is the first we respond to
+    queues = construct_pri_queues(tubes.map {|t| rk_queue(t)})
 
     dopush = nil
 
@@ -318,7 +345,7 @@ module Rescheduler
       # This may not be desirable...
       # (too bad BRPOPLPUSH does not support multiple queues...)
       # TODO: Maybe LUA script is the way out of this.
-      result = redis.brpop(keys, :timeout=>timeout)
+      result = redis.brpop(queues, :timeout=>timeout)
 
       # Handle task
       if result # Got a task
@@ -332,6 +359,8 @@ module Rescheduler
           Worker.handle_command(qnid)
         else
           run_job(qnid)
+          # Regenerate prioritized queue list based on current handled tasks, if we do round_robin
+          queues = construct_pri_queues(tubes.map {|t| rk_queue(t)}, tube) if start_opts[:round_robin]
         end
       else
         # Do nothing when got timeout, the run_maintenance will take care of deferred jobs
@@ -340,6 +369,21 @@ module Rescheduler
   end
 
   def end_job_loop; @@end_job_loop = true; end
+
+  # Perform a "fair" round robin rotation of queues by rotating the "current" queue to the end of the list
+  private def construct_pri_queues(queues, current = nil)
+    idx = queues.index(current) if current
+    # Rotate if needed
+    queues = queues[(idx+1)..-1] + queues[0..idx] if idx && idx < queues.size - 1
+
+    # Prepend Queue to control a named worker
+    worker_queue = Worker.rk_queue if Worker.named?
+    queues.unshift(worker_queue) if worker_queue # worker control queue is the first we respond to
+
+    # Append rk_maintenance
+    queues << rk_maintenace
+    return queues
+  end
 
 
   # Logging facility

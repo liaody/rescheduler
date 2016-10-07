@@ -1,3 +1,11 @@
+0.5.4
+-----
+* Rescheduler.start options for round_robin
+
+0.5.3 (minor)
+-----
+* Fix licensing and versioning problems
+
 0.5.2
 -----
 * Fix logging with bad unicode
