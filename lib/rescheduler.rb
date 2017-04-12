@@ -3,6 +3,11 @@ require 'time' # Needed for Time.parse
 require 'multi_json'
 require 'redis'
 
+if defined? Rails
+  require 'rescheduler/active_job'
+  require 'active_job/queue_adapters/rescheduler_adapter'
+end
+
 require File.expand_path('../rescheduler/worker', __FILE__)
 require File.expand_path('../rescheduler/sync', __FILE__)
 
@@ -659,6 +664,11 @@ module Rescheduler
     end
 
     raise 'Can only specify one recurrance parameter' if rcnt > 1
+  end
+
+  if defined? Rails
+    # mixin the rescheduler/active_job module
+    self.include ActiveJob
   end
 
 end
